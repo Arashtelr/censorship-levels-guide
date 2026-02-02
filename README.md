@@ -23,20 +23,27 @@
 ### اسکریپت تشخیص سطح فیلترینگ
 
 **فایل:** `scripts/detect-level.sh`  
-**نسخه فعلی:** **3.0** (بهمن ۱۴۰۴ / فوریه ۲۰۲۶)  
-**ویژگی‌های اصلی نسخه ۳:**  
-• تست‌های جامع (TCP + UDP + TLS + HTTP + DNS + Traceroute + MTU)  
-• تشخیص DPI و Active Probing  
-• تست پایداری طولانی اتصال  
-• رابط کاربری حرفه‌ای با رنگ، لاگ‌گیری و تحلیل دقیق  
-• پیشنهاد تونل به‌روز برای هر سطح
+**نسخه فعلی:** **3.1** (اصلاح و پایدارسازی – بهمن ۱۴۰۴ / فوریه ۲۰۲۶)
+
+**تغییرات مهم در نسخه 3.1 نسبت به 3.0:**
+- رفع باگ‌ها و ناپایداری‌های نسخه قبلی
+- بهبود تشخیص سطوح ۴ (SPI) و ۵ (DPI)
+- اصلاح منطق تحلیل و پایداری تست اتصال
+- ساده‌سازی برخی بخش‌ها برای اجرای سریع‌تر و خطای کمتر
+
+**ویژگی‌های اصلی:**
+- تست‌های جامع (TCP + UDP + TLS + HTTP + DNS + Traceroute + MTU)
+- تشخیص DPI و Active Probing
+- تست پایداری طولانی اتصال
+- رابط کاربری حرفه‌ای با رنگ، لاگ‌گیری و خروجی خوانا
+- پیشنهاد تونل به‌روز برای هر سطح
 
 **بهترین روش اجرا (دقیق‌ترین نتیجه):**  
 روی VPS خارج از ایران اجرا کنید و IP سرور داخل ایران را بدهید.
 
 ```bash
-# دانلود نسخه ۳.۰
-curl -L https://github.com/Arashtelr/censorship-levels-guide/releases/download/v3.0/detect-level.sh -o detect.sh
+# دانلود نسخه 3.1 (توصیه‌شده)
+curl -L https://github.com/Arashtelr/censorship-levels-guide/releases/download/v3.1/detect-level.sh -o detect.sh
 
 # یا از raw (اگر release هنوز ساخته نشده)
 # curl -L https://raw.githubusercontent.com/Arashtelr/censorship-levels-guide/main/scripts/detect-level.sh -o detect.sh
