@@ -1,176 +1,217 @@
 #!/bin/bash
-
 #══════════════════════════════════════════════════════════════════════════════
-#  Filtering Level Detection Script v3.0
-#  Comprehensive network filtering analysis tool
+# Filtering Level Detection Script v3.1 (Fixed)
+# Comprehensive Network Filtering Analysis
+# Fixed: Robust parsing, proper error handling, cleanup traps
 #══════════════════════════════════════════════════════════════════════════════
 
-# Strict mode
-set -euo pipefail
-
 #──────────────────────────────────────────────────────────────────────────────
-# Configuration
+# CONFIGURATION
 #──────────────────────────────────────────────────────────────────────────────
 
-VERSION="3.0"
-TIMEOUT_SHORT=3
-TIMEOUT_MEDIUM=5
-TIMEOUT_LONG=15
-CONNECTION_TEST_DURATION=30
-LOG_FILE="/tmp/filter_detect_$(date +%Y%m%d_%H%M%S).log"
+# Don't use strict mode globally - handle errors manually for robustness
+set +e
 
-# Ports to test
-TCP_PORTS=(22 80 443 8080 8443 2053 2083 2087 2096 3389 5432)
-UDP_PORTS=(53 443 1194 51820 4500)
-COMMON_BLOCKED=(22 3389 5432 1194)
-USUALLY_OPEN=(80 443 53)
+# Colors
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly MAGENTA='\033[0;35m'
+readonly WHITE='\033[1;37m'
+readonly NC='\033[0m'
+readonly BOLD='\033[1m'
+
+# Timeouts (reduced for reliability)
+readonly ICMP_TIMEOUT=3
+readonly TCP_TIMEOUT=5
+readonly TLS_TIMEOUT=8
+readonly HTTP_TIMEOUT=8
+readonly STABILITY_DURATION=15
+readonly UDP_TIMEOUT=3
+
+# Test ports
+readonly TCP_PORTS=(22 80 443 8080 8443 2053 2083 2087 2096)
+readonly UDP_PORTS=(53 443 51820 1194)
+
+# Results associative array
+declare -A RESULTS
+declare -A DETAILS
+
+# Logging
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOGFILE="/tmp/filter_detect_${TIMESTAMP}_$$.log"
+
+# Cleanup trap
+cleanup() {
+    # Kill any background jobs
+    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null
+    # Remove temp files if any
+    rm -f /tmp/filter_test_$$.* 2>/dev/null
+}
+trap cleanup EXIT INT TERM
 
 #──────────────────────────────────────────────────────────────────────────────
-# Colors & Formatting
-#──────────────────────────────────────────────────────────────────────────────
-
-if [[ -t 1 ]]; then
-    R='\033[0;31m'      # Red
-    G='\033[0;32m'      # Green
-    Y='\033[1;33m'      # Yellow
-    B='\033[0;34m'      # Blue
-    P='\033[0;35m'      # Purple
-    C='\033[0;36m'      # Cyan
-    W='\033[1;37m'      # White Bold
-    N='\033[0m'         # Reset
-    BOLD='\033[1m'
-    DIM='\033[2m'
-else
-    R=''; G=''; Y=''; B=''; P=''; C=''; W=''; N=''; BOLD=''; DIM=''
-fi
-
-#──────────────────────────────────────────────────────────────────────────────
-# Helper Functions
+# UTILITY FUNCTIONS
 #──────────────────────────────────────────────────────────────────────────────
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE"
 }
 
 print_header() {
-    echo -e "\n${B}╔══════════════════════════════════════════════════════════════╗${N}"
-    echo -e "${B}║${W}  $1${N}"
-    echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
-}
-
-print_section() {
-    echo -e "\n${C}┌──────────────────────────────────────────────────────────────┐${N}"
-    echo -e "${C}│${W} $1${N}"
-    echo -e "${C}└──────────────────────────────────────────────────────────────┘${N}"
+    echo -e "\n${BLUE}┌──────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BLUE}│${NC} $1"
+    echo -e "${BLUE}└──────────────────────────────────────────────────────────────┘${NC}"
 }
 
 print_result() {
-    local label="$1"
+    local test_name="$1"
     local status="$2"
-    local detail="${3:-}"
+    local details="${3:-}"
     
-    printf "  %-25s" "$label"
-    
-    case "$status" in
-        "pass"|"open"|"ok"|"yes"|"1")
-            echo -e "${G}✓ PASS${N} ${DIM}${detail}${N}"
-            ;;
-        "fail"|"closed"|"blocked"|"no"|"0")
-            echo -e "${R}✗ FAIL${N} ${DIM}${detail}${N}"
-            ;;
-        "warn"|"partial"|"slow")
-            echo -e "${Y}⚠ WARN${N} ${DIM}${detail}${N}"
-            ;;
-        "info")
-            echo -e "${C}ℹ INFO${N} ${DIM}${detail}${N}"
-            ;;
-        *)
-            echo -e "${P}? $status${N} ${DIM}${detail}${N}"
-            ;;
-    esac
+    if [[ "$status" == "PASS" || "$status" == "1" ]]; then
+        echo -e "  ${GREEN}✓${NC} ${test_name}: ${GREEN}PASS${NC} ${details}"
+    elif [[ "$status" == "FAIL" || "$status" == "0" ]]; then
+        echo -e "  ${RED}✗${NC} ${test_name}: ${RED}FAIL${NC} ${details}"
+    else
+        echo -e "  ${YELLOW}?${NC} ${test_name}: ${YELLOW}${status}${NC} ${details}"
+    fi
 }
 
-progress_bar() {
-    local current=$1
-    local total=$2
-    local width=40
-    local percent=$((current * 100 / total))
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
+validate_ip() {
+    local ip="$1"
     
-    printf "\r  ${DIM}[${N}"
-    printf "${G}%${filled}s${N}" | tr ' ' '█'
-    printf "${DIM}%${empty}s${N}" | tr ' ' '░'
-    printf "${DIM}]${N} ${W}%3d%%${N}" "$percent"
+    # Check for valid IPv4
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        IFS='.' read -ra ADDR <<< "$ip"
+        for i in "${ADDR[@]}"; do
+            if [[ $i -gt 255 ]]; then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    
+    # Check for valid hostname
+    if [[ $ip =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
+        return 0
+    fi
+    
+    return 1
 }
 
 check_dependencies() {
-    local deps=(nc curl ping timeout openssl nslookup traceroute awk grep)
     local missing=()
+    local deps=(ping nc curl openssl awk grep sed timeout)
+    local optional_deps=(traceroute nmap dig nslookup)
     
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing+=("$dep")
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
         fi
     done
     
     if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${Y}Missing dependencies: ${missing[*]}${N}"
-        echo -e "${DIM}Install with: apt install netcat curl iputils-ping coreutils openssl dnsutils traceroute${N}"
-        return 1
+        echo -e "${RED}Error: Missing required dependencies: ${missing[*]}${NC}"
+        echo "Install with: apt install netcat-openbsd curl openssl"
+        exit 1
     fi
-    return 0
-}
-
-spinner() {
-    local pid=$1
-    local msg="${2:-Processing}"
-    local spinchars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local i=0
     
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${C}${spinchars:$i:1}${N} %s..." "$msg"
-        i=$(( (i + 1) % ${#spinchars} ))
-        sleep 0.1
+    # Check optional
+    for cmd in "${optional_deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log "Optional dependency missing: $cmd"
+        fi
     done
-    printf "\r  %-50s\r" " "
 }
 
 #──────────────────────────────────────────────────────────────────────────────
-# Test Functions
+# TEST FUNCTIONS (Robust Error Handling)
 #──────────────────────────────────────────────────────────────────────────────
 
 test_icmp() {
     local ip="$1"
-    local count=5
-    local result
+    local count=4
     
     log "Testing ICMP to $ip"
     
-    result=$(ping -c $count -W 2 "$ip" 2>/dev/null) || true
+    # Run ping and capture output
+    local result
+    result=$(ping -c "$count" -W "$ICMP_TIMEOUT" "$ip" 2>&1) || true
     
-    local transmitted=$(echo "$result" | grep -oP '\d+(?= packets transmitted)' || echo "0")
-    local received=$(echo "$result" | grep -oP '\d+(?= received)' || echo "0")
-    local loss=$(echo "$result" | grep -oP '\d+(?=% packet loss)' || echo "100")
-    local avg_rtt=$(echo "$result" | grep -oP 'rtt.*= [\d.]+/([\d.]+)' | grep -oP '[\d.]+' | sed -n '2p' || echo "N/A")
+    # Robust parsing with awk and fallbacks
+    local transmitted received loss avg_rtt
     
-    echo "$received $loss $avg_rtt"
+    # Parse transmitted packets
+    transmitted=$(echo "$result" | awk '/packets transmitted/ {print $1}' 2>/dev/null) || true
+    [[ -z "$transmitted" ]] && transmitted=0
+    
+    # Parse received packets  
+    received=$(echo "$result" | awk '/packets transmitted/ {
+        for(i=1; i<=NF; i++) {
+            if($i == "received" || $i == "received,") {
+                print $(i-1)
+                exit
+            }
+        }
+    }' 2>/dev/null) || true
+    [[ -z "$received" ]] && received=0
+    
+    # Parse packet loss
+    loss=$(echo "$result" | awk -F'[% ]' '/packet loss/ {
+        for(i=1; i<=NF; i++) {
+            if($(i+1) == "packet" || $i ~ /loss/) {
+                gsub(/[^0-9]/,"",$i)
+                if($i != "") print $i
+                exit
+            }
+        }
+    }' 2>/dev/null) || true
+    
+    # Fallback: calculate loss if parsing failed
+    if [[ -z "$loss" ]]; then
+        if [[ "$transmitted" -gt 0 ]]; then
+            loss=$(( (transmitted - received) * 100 / transmitted ))
+        else
+            loss=100
+        fi
+    fi
+    
+    # Parse RTT
+    avg_rtt=$(echo "$result" | awk -F'[/= ]' '/rtt|round-trip/ {
+        for(i=1; i<=NF; i++) {
+            if($i ~ /^[0-9]+\.[0-9]+$/) {
+                print $i
+                exit
+            }
+        }
+    }' 2>/dev/null) || true
+    [[ -z "$avg_rtt" ]] && avg_rtt="N/A"
+    
+    # Store results
+    RESULTS[icmp]=$( [[ "$received" -gt 0 ]] && echo 1 || echo 0 )
+    DETAILS[icmp]="tx:$transmitted rx:$received loss:${loss}% rtt:${avg_rtt}ms"
+    
+    log "ICMP Result: ${RESULTS[icmp]} - ${DETAILS[icmp]}"
+    
+    return 0
 }
 
 test_tcp_port() {
     local ip="$1"
     local port="$2"
-    local timeout="${3:-$TIMEOUT_SHORT}"
     
     log "Testing TCP $ip:$port"
     
-    local start=$(date +%s%N)
-    if timeout "$timeout" nc -z -w "$timeout" "$ip" "$port" 2>/dev/null; then
-        local end=$(date +%s%N)
-        local latency=$(( (end - start) / 1000000 ))
-        echo "open $latency"
+    # Use timeout + nc for reliable testing
+    if timeout "$TCP_TIMEOUT" nc -z -w "$TCP_TIMEOUT" "$ip" "$port" 2>/dev/null; then
+        log "TCP $port: OPEN"
+        return 0
     else
-        echo "closed 0"
+        log "TCP $port: CLOSED/FILTERED"
+        return 1
     fi
 }
 
@@ -180,12 +221,27 @@ test_udp_port() {
     
     log "Testing UDP $ip:$port"
     
-    # UDP test is tricky - we check if we get ICMP unreachable
-    if timeout "$TIMEOUT_SHORT" nc -zu -w "$TIMEOUT_SHORT" "$ip" "$port" 2>/dev/null; then
-        echo "open"
-    else
-        echo "unknown"
+    # UDP testing is inherently unreliable
+    # For DNS (53), we can do a real test
+    if [[ "$port" == "53" ]]; then
+        # Try actual DNS query
+        local dns_result
+        dns_result=$(timeout "$UDP_TIMEOUT" dig +short +time=2 +tries=1 @"$ip" google.com A 2>/dev/null) || true
+        
+        if [[ -n "$dns_result" ]]; then
+            log "UDP 53 (DNS): OPEN (got response)"
+            return 0
+        fi
     fi
+    
+    # For other UDP ports, use nc -zu but mark as heuristic
+    if timeout "$UDP_TIMEOUT" nc -zu -w "$UDP_TIMEOUT" "$ip" "$port" 2>/dev/null; then
+        log "UDP $port: POSSIBLY OPEN (heuristic)"
+        return 0
+    fi
+    
+    log "UDP $port: CLOSED/FILTERED/UNKNOWN"
+    return 1
 }
 
 test_tls_handshake() {
@@ -193,771 +249,490 @@ test_tls_handshake() {
     local port="${2:-443}"
     local sni="${3:-$ip}"
     
-    log "Testing TLS handshake to $ip:$port with SNI $sni"
+    log "Testing TLS handshake to $ip:$port with SNI=$sni"
     
     local result
-    local start=$(date +%s%N)
-    
-    result=$(timeout "$TIMEOUT_MEDIUM" openssl s_client \
+    result=$(timeout "$TLS_TIMEOUT" openssl s_client \
         -connect "$ip:$port" \
         -servername "$sni" \
-        -brief \
+        -verify_return_error \
         </dev/null 2>&1) || true
     
-    local end=$(date +%s%N)
-    local latency=$(( (end - start) / 1000000 ))
+    local status=0
+    local protocol=""
+    local cipher=""
+    local verify=""
     
-    if echo "$result" | grep -qi "CONNECTION ESTABLISHED\|Protocol.*TLSv"; then
-        local protocol=$(echo "$result" | grep -oP 'Protocol version: \K.*' || echo "unknown")
-        local cipher=$(echo "$result" | grep -oP 'Ciphersuite: \K.*' || echo "unknown")
-        echo "success $latency $protocol $cipher"
-    elif echo "$result" | grep -qi "connection refused"; then
-        echo "refused $latency"
-    elif echo "$result" | grep -qi "connection reset"; then
-        echo "reset $latency"
-    elif echo "$result" | grep -qi "timed out\|timeout"; then
-        echo "timeout $latency"
-    else
-        echo "failed $latency"
+    # Check for successful connection (multiple indicators)
+    if echo "$result" | grep -qiE "(CONNECTED|SSL-Session:|New,|Protocol.*:)"; then
+        status=1
+        
+        # Extract protocol version
+        protocol=$(echo "$result" | awk -F': ' '/Protocol/ {print $2; exit}' 2>/dev/null) || true
+        [[ -z "$protocol" ]] && protocol=$(echo "$result" | grep -oE 'TLSv[0-9.]+' | head -1) || true
+        
+        # Extract cipher
+        cipher=$(echo "$result" | awk -F': ' '/Cipher/ {print $2; exit}' 2>/dev/null) || true
+        
+        # Check verification
+        if echo "$result" | grep -q "Verify return code: 0"; then
+            verify="verified"
+        else
+            verify="unverified"
+        fi
     fi
+    
+    RESULTS[tls]=$status
+    DETAILS[tls]="proto:${protocol:-N/A} cipher:${cipher:-N/A} ${verify:-}"
+    
+    log "TLS Result: $status - ${DETAILS[tls]}"
+    
+    return 0
 }
 
-test_http_request() {
+test_http() {
     local ip="$1"
     local port="${2:-80}"
-    local protocol="${3:-http}"
+    local proto="http"
+    [[ "$port" == "443" ]] && proto="https"
     
-    log "Testing HTTP request to $protocol://$ip:$port"
+    log "Testing HTTP to $proto://$ip:$port"
     
-    local start=$(date +%s%N)
-    local result
+    local http_code
+    local response_time
     
-    result=$(timeout "$TIMEOUT_MEDIUM" curl -sS -o /dev/null \
+    # Use curl with all relevant options
+    local curl_result
+    curl_result=$(curl -sS -o /dev/null \
         -w "%{http_code}|%{time_total}|%{ssl_verify_result}" \
-        --connect-timeout "$TIMEOUT_SHORT" \
+        --connect-timeout "$HTTP_TIMEOUT" \
+        --max-time "$HTTP_TIMEOUT" \
         -k \
-        "$protocol://$ip:$port" 2>&1) || true
+        "$proto://$ip:$port/" 2>&1) || true
     
-    local end=$(date +%s%N)
+    http_code=$(echo "$curl_result" | cut -d'|' -f1)
+    response_time=$(echo "$curl_result" | cut -d'|' -f2)
     
-    if [[ "$result" =~ ^[0-9]{3}\| ]]; then
-        local http_code=$(echo "$result" | cut -d'|' -f1)
-        local time_total=$(echo "$result" | cut -d'|' -f2)
-        echo "$http_code $time_total"
-    else
-        echo "000 0"
+    # Validate http_code
+    if [[ ! "$http_code" =~ ^[0-9]+$ ]]; then
+        http_code="000"
     fi
+    
+    local status=0
+    if [[ "$http_code" != "000" ]]; then
+        status=1
+    fi
+    
+    RESULTS[http]=$status
+    DETAILS[http]="code:$http_code time:${response_time:-N/A}s"
+    
+    log "HTTP Result: $status - ${DETAILS[http]}"
+    
+    return 0
 }
 
 test_connection_stability() {
     local ip="$1"
     local port="${2:-443}"
-    local duration="${3:-$CONNECTION_TEST_DURATION}"
+    local duration="${3:-$STABILITY_DURATION}"
     
     log "Testing connection stability to $ip:$port for ${duration}s"
     
-    local temp_file=$(mktemp)
-    local start=$(date +%s)
+    # Only test if port is open
+    if ! test_tcp_port "$ip" "$port"; then
+        RESULTS[stability]=0
+        DETAILS[stability]="port closed"
+        return 0
+    fi
     
-    # Start connection in background
-    timeout "$duration" nc -w "$duration" "$ip" "$port" </dev/null >"$temp_file" 2>&1 &
-    local pid=$!
-    
-    # Monitor connection
+    local temp_file="/tmp/filter_test_$$.stability"
+    local start_time=$(date +%s)
     local checks=0
-    local alive=0
+    local successful=0
     
-    while [[ $(($(date +%s) - start)) -lt $duration ]]; do
+    # Start background connection
+    timeout "$duration" nc "$ip" "$port" </dev/null >"$temp_file" 2>&1 &
+    local nc_pid=$!
+    
+    # Check connection periodically
+    local check_interval=2
+    while [[ $(($(date +%s) - start_time)) -lt $duration ]]; do
+        sleep "$check_interval"
         ((checks++))
-        if kill -0 "$pid" 2>/dev/null; then
-            ((alive++))
+        
+        if kill -0 "$nc_pid" 2>/dev/null; then
+            ((successful++))
         else
             break
         fi
-        sleep 2
     done
     
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    # Cleanup
+    kill "$nc_pid" 2>/dev/null || true
+    wait "$nc_pid" 2>/dev/null || true
     rm -f "$temp_file"
     
-    local actual_duration=$(($(date +%s) - start))
-    local stability=$((alive * 100 / (checks > 0 ? checks : 1)))
-    
-    echo "$actual_duration $stability $checks"
-}
-
-test_dns_resolution() {
-    local ip="$1"
-    local domain="${2:-google.com}"
-    
-    log "Testing DNS resolution via $ip for $domain"
-    
-    local start=$(date +%s%N)
-    local result
-    
-    result=$(timeout "$TIMEOUT_SHORT" nslookup "$domain" "$ip" 2>&1) || true
-    
-    local end=$(date +%s%N)
-    local latency=$(( (end - start) / 1000000 ))
-    
-    if echo "$result" | grep -qi "Address.*[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+" | grep -v "$ip"; then
-        echo "success $latency"
-    else
-        echo "failed $latency"
+    local stability_pct=0
+    if [[ $checks -gt 0 ]]; then
+        stability_pct=$((successful * 100 / checks))
     fi
+    
+    RESULTS[stability]=$( [[ $stability_pct -ge 80 ]] && echo 1 || echo 0 )
+    DETAILS[stability]="${stability_pct}% (${successful}/${checks} checks)"
+    
+    log "Stability Result: ${RESULTS[stability]} - ${DETAILS[stability]}"
+    
+    return 0
 }
 
-test_traceroute() {
+test_active_probe_resistance() {
     local ip="$1"
-    local max_hops="${2:-15}"
+    local port="${2:-443}"
     
-    log "Running traceroute to $ip"
+    log "Testing active probe resistance on $ip:$port"
     
-    local result
-    result=$(timeout 30 traceroute -T -p 443 -m "$max_hops" -n "$ip" 2>&1) || true
+    # Send invalid data and check response
+    local response
+    response=$(echo "INVALID_PROBE_TEST_12345" | \
+        timeout 3 nc -w 2 "$ip" "$port" 2>/dev/null) || true
     
-    local hops=$(echo "$result" | grep -c "^ *[0-9]" || echo "0")
-    local complete=$(echo "$result" | grep -q " $ip " && echo "yes" || echo "no")
-    local last_responding=$(echo "$result" | grep -v '\* \* \*' | tail -1 | awk '{print $1}' || echo "0")
+    local status=0
+    if [[ -z "$response" ]]; then
+        # No response to invalid probe = potentially protected
+        status=1
+        DETAILS[probe_resist]="no response to invalid probe"
+    else
+        DETAILS[probe_resist]="responded to invalid probe"
+    fi
     
-    echo "$hops $complete $last_responding"
+    RESULTS[probe_resist]=$status
+    
+    log "Probe Resistance: $status - ${DETAILS[probe_resist]}"
+    
+    return 0
+}
+
+test_entropy_detection() {
+    local ip="$1"
+    local port="${2:-443}"
+    
+    log "Testing entropy-based filtering on $ip:$port"
+    
+    # Test with high entropy (random) data
+    local high_entropy_result
+    dd if=/dev/urandom bs=100 count=1 2>/dev/null | \
+        timeout 3 nc -w 2 "$ip" "$port" >/dev/null 2>&1
+    high_entropy_result=$?
+    
+    # Test with low entropy (text) data
+    local low_entropy_result
+    echo "GET / HTTP/1.1\r\nHost: test.com\r\n\r\n" | \
+        timeout 3 nc -w 2 "$ip" "$port" >/dev/null 2>&1
+    low_entropy_result=$?
+    
+    local status="unknown"
+    if [[ $high_entropy_result -ne 0 && $low_entropy_result -eq 0 ]]; then
+        status="entropy_filtered"
+        RESULTS[entropy]=0
+    elif [[ $high_entropy_result -eq 0 && $low_entropy_result -eq 0 ]]; then
+        status="no_filtering"
+        RESULTS[entropy]=1
+    else
+        status="inconclusive"
+        RESULTS[entropy]=1
+    fi
+    
+    DETAILS[entropy]="$status"
+    log "Entropy Detection: ${RESULTS[entropy]} - $status"
+    
+    return 0
 }
 
 test_mtu() {
     local ip="$1"
-    local start_mtu=1500
-    local min_mtu=500
     
-    log "Testing MTU to $ip"
+    log "Testing MTU path discovery to $ip"
     
-    for mtu in $(seq $start_mtu -100 $min_mtu); do
-        local size=$((mtu - 28))  # IP header (20) + ICMP header (8)
-        if ping -c 1 -M do -s "$size" -W 2 "$ip" &>/dev/null; then
-            echo "$mtu"
-            return
+    # Only run if ICMP works
+    if [[ "${RESULTS[icmp]:-0}" != "1" ]]; then
+        RESULTS[mtu]="unknown"
+        DETAILS[mtu]="ICMP blocked, cannot test"
+        return 0
+    fi
+    
+    local working_mtu=0
+    
+    for size in 1500 1400 1300 1200 1100 1000 800 576 500; do
+        if ping -c 1 -W 2 -M do -s $((size - 28)) "$ip" &>/dev/null; then
+            working_mtu=$size
+            break
         fi
     done
     
-    echo "unknown"
-}
-
-test_protocol_detection() {
-    local ip="$1"
-    local port="${2:-443}"
-    
-    log "Testing protocol detection/DPI on $ip:$port"
-    
-    local results=""
-    
-    # Test 1: Pure TLS
-    local tls_result=$(test_tls_handshake "$ip" "$port")
-    local tls_status=$(echo "$tls_result" | awk '{print $1}')
-    
-    # Test 2: Send random bytes (should trigger DPI if active)
-    local random_test
-    random_test=$(timeout "$TIMEOUT_SHORT" bash -c "head -c 32 /dev/urandom | nc -w 2 $ip $port" 2>&1) || true
-    
-    # Test 3: Send HTTP-like data on non-HTTP port
-    local http_test
-    http_test=$(timeout "$TIMEOUT_SHORT" bash -c "echo -e 'GET / HTTP/1.1\r\nHost: test\r\n\r\n' | nc -w 2 $ip $port" 2>&1) || true
-    
-    # Analysis
-    if [[ "$tls_status" == "reset" ]]; then
-        echo "dpi_active reset_on_tls"
-    elif [[ "$tls_status" == "success" ]] && [[ -z "$http_test" ]]; then
-        echo "possible_dpi selective"
-    elif [[ "$tls_status" == "success" ]]; then
-        echo "no_dpi clean"
+    if [[ $working_mtu -gt 0 ]]; then
+        RESULTS[mtu]=1
+        DETAILS[mtu]="max MTU: ${working_mtu}"
     else
-        echo "unknown $tls_status"
+        RESULTS[mtu]=0
+        DETAILS[mtu]="MTU discovery failed"
     fi
-}
-
-test_active_probing() {
-    local ip="$1"
-    local port="${2:-443}"
     
-    log "Testing for active probing indicators on $ip:$port"
+    log "MTU Result: ${RESULTS[mtu]} - ${DETAILS[mtu]}"
     
-    # This is a heuristic - we make multiple connections and check for patterns
-    local results=()
-    
-    for i in {1..5}; do
-        local result=$(test_tcp_port "$ip" "$port" 2)
-        results+=("$(echo "$result" | awk '{print $1}')")
-        sleep 1
-    done
-    
-    local open_count=0
-    for r in "${results[@]}"; do
-        [[ "$r" == "open" ]] && ((open_count++))
-    done
-    
-    if [[ $open_count -eq 5 ]]; then
-        echo "consistent open"
-    elif [[ $open_count -eq 0 ]]; then
-        echo "consistent closed"
-    else
-        echo "inconsistent $open_count/5"
-    fi
+    return 0
 }
 
 #──────────────────────────────────────────────────────────────────────────────
-# Level Detection Logic
+# ANALYSIS FUNCTIONS
 #──────────────────────────────────────────────────────────────────────────────
 
 analyze_results() {
-    local -n res=$1
+    local open_tcp_ports=0
+    local open_udp_ports=0
     
-    # Level determination logic
-    local level=0
-    local confidence="low"
-    local details=""
-    
-    # Check Level 1: ICMP Blocking
-    if [[ "${res[icmp_received]}" == "0" ]] && [[ "${res[tcp_open_count]}" -gt 0 ]]; then
-        level=1
-        confidence="high"
-        details="ICMP blocked, TCP working"
-    fi
-    
-    # Check Level 2: Port Blocking
-    if [[ "${res[tcp_open_count]}" -gt 0 ]] && [[ "${res[tcp_open_count]}" -lt "${res[tcp_tested_count]}" ]]; then
-        local blocked_common=0
-        for port in "${COMMON_BLOCKED[@]}"; do
-            [[ "${res[tcp_$port]:-closed}" == "closed" ]] && ((blocked_common++))
-        done
-        
-        if [[ $blocked_common -gt 2 ]]; then
-            level=2
-            confidence="high"
-            details="Selective port blocking detected"
-        fi
-    fi
-    
-    # Check Level 3: IP Blocking
-    if [[ "${res[tcp_open_count]}" -eq 0 ]]; then
-        level=3
-        confidence="high"
-        details="All ports blocked - IP blacklisted"
-    fi
-    
-    # Check Level 4: Stateful Inspection
-    if [[ "${res[connection_stability]:-100}" -lt 80 ]] && [[ "${res[tcp_443]}" == "open" ]]; then
-        level=4
-        confidence="medium"
-        details="Connection drops detected - SPI suspected"
-    fi
-    
-    # Check Level 5: DPI
-    if [[ "${res[dpi_status]}" == "dpi_active" ]] || [[ "${res[tls_443]}" == "reset" ]]; then
-        level=5
-        confidence="high"
-        details="Protocol inspection detected"
-    fi
-    
-    # Check Level 6: Whitelist
-    if [[ "${res[tcp_443]}" == "closed" ]] && [[ "${res[tcp_80]}" == "closed" ]] && [[ "${res[dns_works]}" == "yes" ]]; then
-        level=6
-        confidence="medium"
-        details="Possible whitelist - only DNS working"
-    fi
-    
-    echo "$level $confidence $details"
-}
-
-#──────────────────────────────────────────────────────────────────────────────
-# Main Execution
-#──────────────────────────────────────────────────────────────────────────────
-
-main() {
-    local target_ip="${1:-}"
-    
-    # Validate input
-    if [[ -z "$target_ip" ]]; then
-        echo -e "${W}Filtering Level Detection Script v${VERSION}${N}"
-        echo -e "${DIM}Comprehensive network filtering analysis tool${N}\n"
-        echo -e "Usage: $0 <target_ip> [options]\n"
-        echo -e "Options:"
-        echo -e "  -f, --fast       Fast scan (fewer tests)"
-        echo -e "  -v, --verbose    Verbose output"
-        echo -e "  -o, --output     Save report to file"
-        echo -e "  -h, --help       Show this help"
-        exit 1
-    fi
-    
-    # Check dependencies
-    check_dependencies || exit 1
-    
-    # Initialize results
-    declare -A RESULTS
-    local total_tests=0
-    local completed_tests=0
-    
-    # Calculate total tests
-    total_tests=$((1 + ${#TCP_PORTS[@]} + ${#UDP_PORTS[@]} + 5))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Header
-    #──────────────────────────────────────────────────────────────────────────
-    
-    clear
-    echo -e "${B}╔══════════════════════════════════════════════════════════════════════╗${N}"
-    echo -e "${B}║${N}      ${W}🔬 Filtering Level Detection Script v${VERSION}${N}                       ${B}║${N}"
-    echo -e "${B}║${N}      ${DIM}Comprehensive Network Filtering Analysis${N}                          ${B}║${N}"
-    echo -e "${B}╠══════════════════════════════════════════════════════════════════════╣${N}"
-    echo -e "${B}║${N}  Target: ${W}${target_ip}${N}"
-    echo -e "${B}║${N}  Time:   ${DIM}$(date '+%Y-%m-%d %H:%M:%S')${N}"
-    echo -e "${B}║${N}  Log:    ${DIM}${LOG_FILE}${N}"
-    echo -e "${B}╚══════════════════════════════════════════════════════════════════════╝${N}"
-    
-    log "Starting scan of $target_ip"
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 1: ICMP
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "📡 Layer 3: ICMP Test"
-    
-    echo -e "  Testing ICMP connectivity..."
-    local icmp_result=$(test_icmp "$target_ip")
-    RESULTS[icmp_received]=$(echo "$icmp_result" | awk '{print $1}')
-    RESULTS[icmp_loss]=$(echo "$icmp_result" | awk '{print $2}')
-    RESULTS[icmp_rtt]=$(echo "$icmp_result" | awk '{print $3}')
-    
-    if [[ "${RESULTS[icmp_received]}" -gt 0 ]]; then
-        print_result "ICMP (Ping)" "pass" "RTT: ${RESULTS[icmp_rtt]}ms, Loss: ${RESULTS[icmp_loss]}%"
-    else
-        print_result "ICMP (Ping)" "fail" "100% packet loss"
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 2: TCP Ports
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "🔌 Layer 4: TCP Port Scan"
-    
-    RESULTS[tcp_open_count]=0
-    RESULTS[tcp_tested_count]=${#TCP_PORTS[@]}
-    
+    # Count open ports
     for port in "${TCP_PORTS[@]}"; do
-        local result=$(test_tcp_port "$target_ip" "$port")
-        local status=$(echo "$result" | awk '{print $1}')
-        local latency=$(echo "$result" | awk '{print $2}')
-        
-        RESULTS[tcp_$port]="$status"
-        
-        if [[ "$status" == "open" ]]; then
-            ((RESULTS[tcp_open_count]++))
-            print_result "Port $port/TCP" "open" "${latency}ms"
-        else
-            print_result "Port $port/TCP" "closed" ""
-        fi
-        
-        ((completed_tests++))
+        [[ "${RESULTS[tcp_$port]:-0}" == "1" ]] && ((open_tcp_ports++))
     done
-    
-    echo -e "\n  ${DIM}Summary: ${RESULTS[tcp_open_count]}/${RESULTS[tcp_tested_count]} ports open${N}"
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 3: UDP Ports
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "📦 Layer 4: UDP Port Scan"
-    
-    RESULTS[udp_open_count]=0
     
     for port in "${UDP_PORTS[@]}"; do
-        local result=$(test_udp_port "$target_ip" "$port")
-        RESULTS[udp_$port]="$result"
-        
-        if [[ "$result" == "open" ]]; then
-            ((RESULTS[udp_open_count]++))
-            print_result "Port $port/UDP" "open" ""
-        else
-            print_result "Port $port/UDP" "unknown" "(UDP state uncertain)"
-        fi
-        
-        ((completed_tests++))
+        [[ "${RESULTS[udp_$port]:-0}" == "1" ]] && ((open_udp_ports++))
     done
     
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 4: TLS Handshake
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "🔐 Layer 5: TLS/SSL Analysis"
-    
-    if [[ "${RESULTS[tcp_443]}" == "open" ]]; then
-        local tls_result=$(test_tls_handshake "$target_ip" 443)
-        RESULTS[tls_443]=$(echo "$tls_result" | awk '{print $1}')
-        RESULTS[tls_latency]=$(echo "$tls_result" | awk '{print $2}')
-        RESULTS[tls_protocol]=$(echo "$tls_result" | awk '{print $3}')
-        RESULTS[tls_cipher]=$(echo "$tls_result" | awk '{print $4}')
-        
-        case "${RESULTS[tls_443]}" in
-            "success")
-                print_result "TLS Handshake" "pass" "${RESULTS[tls_protocol]}"
-                print_result "TLS Latency" "info" "${RESULTS[tls_latency]}ms"
-                ;;
-            "reset")
-                print_result "TLS Handshake" "fail" "Connection reset (DPI?)"
-                ;;
-            "timeout")
-                print_result "TLS Handshake" "fail" "Timeout"
-                ;;
-            *)
-                print_result "TLS Handshake" "fail" "${RESULTS[tls_443]}"
-                ;;
-        esac
-        
-        # Test with different SNI
-        echo -e "\n  ${DIM}Testing SNI manipulation...${N}"
-        
-        local sni_google=$(test_tls_handshake "$target_ip" 443 "www.google.com")
-        local sni_google_status=$(echo "$sni_google" | awk '{print $1}')
-        
-        if [[ "$sni_google_status" == "success" ]]; then
-            print_result "SNI: google.com" "pass" ""
-        else
-            print_result "SNI: google.com" "fail" "$sni_google_status"
-        fi
-    else
-        print_result "TLS Handshake" "fail" "Port 443 closed"
-        RESULTS[tls_443]="port_closed"
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 5: HTTP/HTTPS
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "🌐 Layer 7: HTTP/HTTPS Test"
-    
-    if [[ "${RESULTS[tcp_80]}" == "open" ]]; then
-        local http_result=$(test_http_request "$target_ip" 80 "http")
-        local http_code=$(echo "$http_result" | awk '{print $1}')
-        local http_time=$(echo "$http_result" | awk '{print $2}')
-        
-        RESULTS[http_code]="$http_code"
-        
-        if [[ "$http_code" != "000" ]]; then
-            print_result "HTTP (80)" "pass" "Status: $http_code, Time: ${http_time}s"
-        else
-            print_result "HTTP (80)" "fail" "No response"
-        fi
-    else
-        print_result "HTTP (80)" "fail" "Port closed"
-        RESULTS[http_code]="port_closed"
-    fi
-    
-    if [[ "${RESULTS[tcp_443]}" == "open" ]]; then
-        local https_result=$(test_http_request "$target_ip" 443 "https")
-        local https_code=$(echo "$https_result" | awk '{print $1}')
-        local https_time=$(echo "$https_result" | awk '{print $2}')
-        
-        RESULTS[https_code]="$https_code"
-        
-        if [[ "$https_code" != "000" ]]; then
-            print_result "HTTPS (443)" "pass" "Status: $https_code, Time: ${https_time}s"
-        else
-            print_result "HTTPS (443)" "fail" "No response"
-        fi
-    else
-        print_result "HTTPS (443)" "fail" "Port closed"
-        RESULTS[https_code]="port_closed"
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 6: Connection Stability
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "⏱️ Connection Stability Test"
-    
-    if [[ "${RESULTS[tcp_443]}" == "open" ]]; then
-        echo -e "  ${DIM}Testing connection stability (${CONNECTION_TEST_DURATION}s)...${N}"
-        
-        local stability_result=$(test_connection_stability "$target_ip" 443 "$CONNECTION_TEST_DURATION")
-        RESULTS[connection_duration]=$(echo "$stability_result" | awk '{print $1}')
-        RESULTS[connection_stability]=$(echo "$stability_result" | awk '{print $2}')
-        
-        if [[ "${RESULTS[connection_stability]}" -ge 90 ]]; then
-            print_result "Stability" "pass" "${RESULTS[connection_stability]}% stable for ${RESULTS[connection_duration]}s"
-        elif [[ "${RESULTS[connection_stability]}" -ge 50 ]]; then
-            print_result "Stability" "warn" "${RESULTS[connection_stability]}% - Intermittent drops"
-        else
-            print_result "Stability" "fail" "${RESULTS[connection_stability]}% - Unstable (SPI?)"
-        fi
-    else
-        print_result "Stability" "fail" "Port 443 closed"
-        RESULTS[connection_stability]=0
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 7: DPI Detection
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "🔍 Deep Packet Inspection (DPI) Detection"
-    
-    if [[ "${RESULTS[tcp_443]}" == "open" ]]; then
-        local dpi_result=$(test_protocol_detection "$target_ip" 443)
-        RESULTS[dpi_status]=$(echo "$dpi_result" | awk '{print $1}')
-        RESULTS[dpi_detail]=$(echo "$dpi_result" | awk '{print $2}')
-        
-        case "${RESULTS[dpi_status]}" in
-            "dpi_active")
-                print_result "DPI Detection" "fail" "Active DPI detected!"
-                ;;
-            "possible_dpi")
-                print_result "DPI Detection" "warn" "Possible DPI"
-                ;;
-            "no_dpi")
-                print_result "DPI Detection" "pass" "No DPI detected"
-                ;;
-            *)
-                print_result "DPI Detection" "info" "Inconclusive"
-                ;;
-        esac
-        
-        # Active probing detection
-        local probe_result=$(test_active_probing "$target_ip" 443)
-        local probe_status=$(echo "$probe_result" | awk '{print $1}')
-        
-        if [[ "$probe_status" == "inconsistent" ]]; then
-            print_result "Active Probing" "warn" "Possible active probing detected"
-        else
-            print_result "Active Probing" "pass" "Connection consistent"
-        fi
-    else
-        print_result "DPI Detection" "info" "Cannot test - port closed"
-        RESULTS[dpi_status]="unknown"
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 8: DNS
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "📛 DNS Analysis"
-    
-    # Test if target can be used as DNS
-    if [[ "${RESULTS[udp_53]}" == "open" ]]; then
-        local dns_result=$(test_dns_resolution "$target_ip" "google.com")
-        local dns_status=$(echo "$dns_result" | awk '{print $1}')
-        
-        if [[ "$dns_status" == "success" ]]; then
-            print_result "DNS Resolution" "pass" ""
-            RESULTS[dns_works]="yes"
-        else
-            print_result "DNS Resolution" "fail" ""
-            RESULTS[dns_works]="no"
-        fi
-    else
-        print_result "DNS (UDP 53)" "info" "Port closed"
-        RESULTS[dns_works]="no"
-    fi
-    
-    # Test DNS tunnel possibility
-    echo -e "\n  ${DIM}DNS Tunnel Viability:${N}"
-    local public_dns=$(test_dns_resolution "8.8.8.8" "google.com")
-    if [[ $(echo "$public_dns" | awk '{print $1}') == "success" ]]; then
-        print_result "Public DNS Access" "pass" "DNS tunneling possible"
-        RESULTS[dns_tunnel_viable]="yes"
-    else
-        print_result "Public DNS Access" "fail" ""
-        RESULTS[dns_tunnel_viable]="no"
-    fi
-    
-    ((completed_tests++))
-    
-    #──────────────────────────────────────────────────────────────────────────
-    # Test 9: Traceroute
-    #──────────────────────────────────────────────────────────────────────────
-    
-    print_section "🛤️ Network Path Analysis"
-    
-    echo -e "  ${DIM}Running TCP traceroute...${N}"
-    local trace_result=$(test_traceroute "$target_ip" 15)
-    RESULTS[trace_hops]=$(echo "$trace_result" | awk '{print $1}')
-    RESULTS[trace_complete]=$(echo "$trace_result" | awk '{print $2}')
-    RESULTS[trace_last_hop]=$(echo "$trace_result" | awk '{print $3}')
-    
-    print_result "Total Hops" "info" "${RESULTS[trace_hops]}"
-    
-    if [[ "${RESULTS[trace_complete]}" == "yes" ]]; then
-        print_result "Route Complete" "pass" "Target reached"
-    else
-        print_result "Route Complete" "warn" "Blocked at hop ${RESULTS[trace_last_hop]}"
-    fi
-    
-    ((completed_tests++))
-    
-    #══════════════════════════════════════════════════════════════════════════
-    # Final Analysis
-    #══════════════════════════════════════════════════════════════════════════
-    
-    print_header "📊 ANALYSIS RESULTS"
+    RESULTS[open_tcp]=$open_tcp_ports
+    RESULTS[open_udp]=$open_udp_ports
     
     # Determine filtering level
     local level=0
     local level_name=""
-    local confidence=""
     local solution=""
     
-    # Level detection logic
-    if [[ "${RESULTS[tcp_open_count]}" -eq 0 ]]; then
+    if [[ $open_tcp_ports -eq 0 ]]; then
         level=3
         level_name="IP Blacklist"
-        confidence="HIGH"
-        solution="CDN (Cloudflare) / Relay Server / Change IP"
-    elif [[ "${RESULTS[icmp_received]}" -eq 0 ]] && [[ "${RESULTS[tcp_open_count]}" -gt 0 ]]; then
+        solution="Use CDN (Cloudflare) / Relay server / Change IP"
+        
+    elif [[ "${RESULTS[icmp]:-0}" == "0" && $open_tcp_ports -gt 0 ]]; then
         level=1
-        level_name="ICMP Block"
-        confidence="HIGH"
-        solution="Any TCP/UDP tunnel works"
-    elif [[ "${RESULTS[tcp_open_count]}" -lt 4 ]] && [[ "${RESULTS[tcp_443]}" == "open" ]]; then
+        level_name="ICMP Block Only"
+        solution="Any TCP-based tunnel will work"
+        
+    elif [[ $open_tcp_ports -lt 3 ]]; then
         level=2
         level_name="Port Filtering"
-        confidence="MEDIUM"
-        solution="Use port 443/80/53"
-    elif [[ "${RESULTS[connection_stability]}" -lt 70 ]] && [[ "${RESULTS[tcp_443]}" == "open" ]]; then
+        solution="Use port 443 or 80"
+        
+    elif [[ "${RESULTS[stability]:-1}" == "0" && "${RESULTS[tcp_443]:-0}" == "1" ]]; then
         level=4
-        level_name="Stateful Inspection"
-        confidence="MEDIUM"
-        solution="Mux / UDP protocols (WireGuard, QUIC)"
-    elif [[ "${RESULTS[dpi_status]}" == "dpi_active" ]] || [[ "${RESULTS[tls_443]}" == "reset" ]]; then
+        level_name="Stateful Inspection (SPI)"
+        solution="Use Mux / UDP protocols (Hysteria2, TUIC)"
+        
+    elif [[ "${RESULTS[tls]:-1}" == "0" && "${RESULTS[tcp_443]:-0}" == "1" ]]; then
         level=5
-        level_name="DPI Active"
-        confidence="HIGH"
-        solution="Reality / ShadowTLS / Hysteria2"
-    elif [[ "${RESULTS[tcp_443]}" == "closed" ]] && [[ "${RESULTS[tcp_80]}" == "closed" ]] && [[ "${RESULTS[dns_works]}" == "yes" ]]; then
-        level=6
-        level_name="Whitelist Mode"
-        confidence="MEDIUM"
-        solution="DNS Tunnel (dnstt) / Domain Fronting"
+        level_name="Deep Packet Inspection (DPI)"
+        solution="Use Reality / ShadowTLS v3 / Hysteria2"
+        
+    elif [[ "${RESULTS[entropy]:-1}" == "0" ]]; then
+        level=5
+        level_name="DPI with Entropy Analysis"
+        solution="Use Reality / ShadowTLS v3 (mimic real TLS)"
+        
     else
-        level=0
-        level_name="Minimal/None"
-        confidence="HIGH"
-        solution="Standard tunnels work"
+        level=1
+        level_name="Minimal/No Filtering"
+        solution="Standard tunnels should work"
     fi
     
-    # Display level indicator
-    echo -e "\n"
-    echo -e "  ${W}Detected Filtering Level:${N}"
-    echo -e ""
-    echo -e "  ┌─────────────────────────────────────────────────────────────┐"
-    echo -e "  │                                                             │"
+    RESULTS[level]=$level
+    RESULTS[level_name]="$level_name"
+    RESULTS[solution]="$solution"
+}
+
+print_analysis_report() {
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC} ${BOLD}                    FILTERING ANALYSIS REPORT                       ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  Target:        ${WHITE}$TARGET_IP${NC}"
+    echo -e "${BLUE}║${NC}  Test Time:     $(date)"
+    echo -e "${BLUE}║${NC}  Log File:      $LOGFILE"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${BOLD}Test Results:${NC}"
+    echo -e "${BLUE}║${NC}"
     
-    local level_bar=""
-    for i in {0..6}; do
-        if [[ $i -lt $level ]]; then
-            level_bar+="█"
-        elif [[ $i -eq $level ]]; then
-            level_bar+="█"
-        else
-            level_bar+="░"
-        fi
+    # Layer results
+    echo -e "${BLUE}║${NC}  ${CYAN}Layer 3 (Network):${NC}"
+    print_result "    ICMP" "${RESULTS[icmp]:-0}" "${DETAILS[icmp]:-}"
+    [[ -n "${RESULTS[mtu]:-}" ]] && print_result "    MTU" "${RESULTS[mtu]}" "${DETAILS[mtu]:-}"
+    
+    echo -e "${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}Layer 4 (Transport):${NC}"
+    echo -e "${BLUE}║${NC}    TCP Ports Open: ${RESULTS[open_tcp]:-0}/${#TCP_PORTS[@]}"
+    for port in "${TCP_PORTS[@]}"; do
+        [[ -n "${RESULTS[tcp_$port]:-}" ]] && \
+            print_result "      Port $port" "${RESULTS[tcp_$port]}"
     done
+    echo -e "${BLUE}║${NC}    UDP Ports Open: ${RESULTS[open_udp]:-0}/${#UDP_PORTS[@]} (heuristic)"
     
-    local level_color="$G"
-    [[ $level -ge 3 ]] && level_color="$Y"
-    [[ $level -ge 5 ]] && level_color="$R"
+    echo -e "${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}Layer 5-7 (Application):${NC}"
+    print_result "    TLS Handshake" "${RESULTS[tls]:-0}" "${DETAILS[tls]:-}"
+    print_result "    HTTP Response" "${RESULTS[http]:-0}" "${DETAILS[http]:-}"
     
-    echo -e "  │    Level: ${level_color}${BOLD}$level - $level_name${N}"
-    echo -e "  │                                                             │"
-    echo -e "  │    ${DIM}0    1    2    3    4    5    6${N}                         │"
-    echo -e "  │    ${level_color}$level_bar${N}                                   │"
-    echo -e "  │    ${DIM}None ICMP Port IP   SPI  DPI  WL${N}                        │"
-    echo -e "  │                                                             │"
-    echo -e "  │    Confidence: ${W}$confidence${N}"
-    echo -e "  │                                                             │"
-    echo -e "  └─────────────────────────────────────────────────────────────┘"
+    echo -e "${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}Advanced Tests:${NC}"
+    print_result "    Connection Stability" "${RESULTS[stability]:-0}" "${DETAILS[stability]:-}"
+    print_result "    Probe Resistance" "${RESULTS[probe_resist]:-0}" "${DETAILS[probe_resist]:-}"
+    print_result "    Entropy Filter" "${RESULTS[entropy]:-1}" "${DETAILS[entropy]:-}"
     
-    # Solution
-    echo -e "\n"
-    echo -e "  ${W}Recommended Solution:${N}"
-    echo -e "  ${G}→ $solution${N}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${BOLD}DETECTION RESULT:${NC}"
+    echo -e "${BLUE}║${NC}"
     
-    # Quick stats
-    print_section "📈 Quick Stats"
+    local level_color=$GREEN
+    [[ ${RESULTS[level]:-0} -ge 3 ]] && level_color=$YELLOW
+    [[ ${RESULTS[level]:-0} -ge 5 ]] && level_color=$RED
     
-    echo -e "  ┌─────────────────────┬───────────────────────────────────────┐"
-    echo -e "  │ ICMP                │ ${RESULTS[icmp_received]}/5 received, ${RESULTS[icmp_loss]}% loss"
-    echo -e "  │ TCP Ports Open      │ ${RESULTS[tcp_open_count]}/${RESULTS[tcp_tested_count]}"
-    echo -e "  │ TLS Status          │ ${RESULTS[tls_443]:-N/A}"
-    echo -e "  │ Connection Stability│ ${RESULTS[connection_stability]:-N/A}%"
-    echo -e "  │ DPI Status          │ ${RESULTS[dpi_status]:-N/A}"
-    echo -e "  │ DNS Tunnel Viable   │ ${RESULTS[dns_tunnel_viable]:-N/A}"
-    echo -e "  └─────────────────────┴───────────────────────────────────────┘"
-    
-    # Tunnel recommendations
-    print_section "🚀 Tunnel Recommendations"
-    
-    case $level in
-        0|1)
-            echo -e "  ${G}▸${N} iptables NAT forward"
-            echo -e "  ${G}▸${N} Socat / GOST"
-            echo -e "  ${G}▸${N} SSH Tunnel"
-            echo -e "  ${G}▸${N} WireGuard"
-            echo -e "  ${G}▸${N} Any standard tunnel"
-            ;;
-        2)
-            echo -e "  ${G}▸${N} Use port 443 (HTTPS port)"
-            echo -e "  ${G}▸${N} GOST on port 443"
-            echo -e "  ${G}▸${N} SSH on port 443"
-            echo -e "  ${Y}▸${N} Consider: TLS-based protocols"
-            ;;
-        3)
-            echo -e "  ${G}▸${N} Cloudflare CDN + WebSocket"
-            echo -e "  ${G}▸${N} Relay server (Iran → Clean IP → Kharej)"
-            echo -e "  ${Y}▸${N} Change server IP"
-            echo -e "  ${Y}▸${N} Use different datacenter"
-            ;;
-        4)
-            echo -e "  ${G}▸${N} Enable Mux (multiplexing)"
-            echo -e "  ${G}▸${N} WireGuard / QUIC-based"
-            echo -e "  ${G}▸${N} Hysteria2"
-            echo -e "  ${Y}▸${N} Periodic reconnection"
-            ;;
-        5)
-            echo -e "  ${G}▸${N} VLESS + Reality"
-            echo -e "  ${G}▸${N} ShadowTLS v3"
-            echo -e "  ${G}▸${N} Hysteria2"
-            echo -e "  ${G}▸${N} TUIC v5"
-            echo -e "  ${G}▸${N} WebSocket + TLS + CDN"
-            echo -e "  ${Y}▸${N} Use uTLS for fingerprint"
-            ;;
-        6)
-            echo -e "  ${G}▸${N} DNS Tunnel (dnstt)"
-            echo -e "  ${G}▸${N} Iodine"
-            echo -e "  ${Y}▸${N} Domain Fronting (if available)"
-            echo -e "  ${Y}▸${N} Meek (Tor)"
-            echo -e "  ${R}▸${N} Very limited options"
-            ;;
-    esac
-    
-    # Footer
-    echo -e "\n${B}══════════════════════════════════════════════════════════════════════${N}"
-    echo -e "${DIM}Log saved to: $LOG_FILE${N}"
-    echo -e "${DIM}Scan completed at: $(date '+%Y-%m-%d %H:%M:%S')${N}"
-    echo -e "${B}══════════════════════════════════════════════════════════════════════${N}\n"
-    
-    log "Scan completed. Level: $level ($level_name)"
-    
-    return $level
+    echo -e "${BLUE}║${NC}  ${level_color}██████████████████████████████████████████████████████████████${NC}"
+    echo -e "${BLUE}║${NC}  ${level_color}█                                                            █${NC}"
+    echo -e "${BLUE}║${NC}  ${level_color}█   Level ${RESULTS[level]:-?}: ${RESULTS[level_name]:-Unknown}${NC}"
+    echo -e "${BLUE}║${NC}  ${level_color}█                                                            █${NC}"
+    echo -e "${BLUE}║${NC}  ${level_color}██████████████████████████████████████████████████████████████${NC}"
+    echo -e "${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${BOLD}Recommended Solution:${NC}"
+    echo -e "${BLUE}║${NC}  ${WHITE}${RESULTS[solution]:-Unknown}${NC}"
+    echo -e "${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
 }
 
 #──────────────────────────────────────────────────────────────────────────────
-# Entry Point
+# MAIN FUNCTION
 #──────────────────────────────────────────────────────────────────────────────
 
+main() {
+    # Check arguments
+    if [[ $# -lt 1 ]]; then
+        echo -e "${RED}Usage: $0 <IP or hostname> [--fast]${NC}"
+        echo "  --fast: Skip stability and MTU tests"
+        exit 1
+    fi
+    
+    TARGET_IP="$1"
+    FAST_MODE=0
+    [[ "${2:-}" == "--fast" ]] && FAST_MODE=1
+    
+    # Validate IP
+    if ! validate_ip "$TARGET_IP"; then
+        echo -e "${RED}Error: Invalid IP address or hostname: $TARGET_IP${NC}"
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Print header
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC} ${BOLD}🔬 Filtering Level Detection Script v3.1 (Fixed)${NC}                    ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}    Comprehensive Network Filtering Analysis                         ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  Target: ${WHITE}$TARGET_IP${NC}"
+    echo -e "${BLUE}║${NC}  Time:   $(date)"
+    echo -e "${BLUE}║${NC}  Log:    $LOGFILE"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    
+    log "========== Starting analysis of $TARGET_IP =========="
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Layer 3: ICMP
+    # ═══════════════════════════════════════════════════════════════════════
+    print_header "📡 Layer 3: ICMP Test"
+    echo "Testing ICMP connectivity..."
+    test_icmp "$TARGET_IP"
+    print_result "ICMP (Ping)" "${RESULTS[icmp]}" "${DETAILS[icmp]}"
+    
+    # MTU test (only if ICMP works and not fast mode)
+    if [[ "$FAST_MODE" != "1" ]]; then
+        echo "Testing MTU..."
+        test_mtu "$TARGET_IP"
+        [[ -n "${RESULTS[mtu]:-}" ]] && print_result "MTU Path" "${RESULTS[mtu]}" "${DETAILS[mtu]}"
+    fi
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Layer 4: TCP Ports
+    # ═══════════════════════════════════════════════════════════════════════
+    print_header "🔌 Layer 4: TCP Port Scan"
+    echo "Scanning ${#TCP_PORTS[@]} TCP ports..."
+    
+    for port in "${TCP_PORTS[@]}"; do
+        if test_tcp_port "$TARGET_IP" "$port"; then
+            RESULTS[tcp_$port]=1
+        else
+            RESULTS[tcp_$port]=0
+        fi
+        print_result "TCP $port" "${RESULTS[tcp_$port]}"
+    done
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Layer 4: UDP Ports
+    # ═══════════════════════════════════════════════════════════════════════
+    print_header "📨 Layer 4: UDP Port Scan (Heuristic)"
+    echo "Scanning ${#UDP_PORTS[@]} UDP ports..."
+    
+    for port in "${UDP_PORTS[@]}"; do
+        if test_udp_port "$TARGET_IP" "$port"; then
+            RESULTS[udp_$port]=1
+        else
+            RESULTS[udp_$port]=0
+        fi
+        print_result "UDP $port" "${RESULTS[udp_$port]}" "(heuristic)"
+    done
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Layer 5-7: TLS & HTTP
+    # ═══════════════════════════════════════════════════════════════════════
+    print_header "🔒 Layer 5-7: TLS & HTTP Tests"
+    
+    echo "Testing TLS handshake..."
+    test_tls_handshake "$TARGET_IP" 443
+    print_result "TLS Handshake" "${RESULTS[tls]}" "${DETAILS[tls]}"
+    
+    echo "Testing HTTP response..."
+    test_http "$TARGET_IP" 80
+    print_result "HTTP" "${RESULTS[http]}" "${DETAILS[http]}"
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Advanced Tests
+    # ═══════════════════════════════════════════════════════════════════════
+    print_header "🧪 Advanced Filtering Tests"
+    
+    if [[ "$FAST_MODE" != "1" ]]; then
+        echo "Testing connection stability (${STABILITY_DURATION}s)..."
+        test_connection_stability "$TARGET_IP" 443 "$STABILITY_DURATION"
+        print_result "Connection Stability" "${RESULTS[stability]}" "${DETAILS[stability]}"
+    else
+        RESULTS[stability]=1
+        DETAILS[stability]="skipped (fast mode)"
+        print_result "Connection Stability" "SKIPPED" "(fast mode)"
+    fi
+    
+    echo "Testing active probe resistance..."
+    test_active_probe_resistance "$TARGET_IP" 443
+    print_result "Probe Resistance" "${RESULTS[probe_resist]}" "${DETAILS[probe_resist]}"
+    
+    echo "Testing entropy-based filtering..."
+    test_entropy_detection "$TARGET_IP" 443
+    print_result "Entropy Filter" "${RESULTS[entropy]}" "${DETAILS[entropy]}"
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Analysis
+    # ═══════════════════════════════════════════════════════════════════════
+    analyze_results
+    print_analysis_report
+    
+    log "========== Analysis complete =========="
+    
+    echo -e "\n${GREEN}Full log saved to: $LOGFILE${NC}\n"
+}
+
+# Run main
 main "$@"
